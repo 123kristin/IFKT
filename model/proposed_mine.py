@@ -1,0 +1,279 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import math
+import pytorch_lightning as pl
+
+from model.lightgcn import LightGCNStack
+from sklearn.metrics import roc_auc_score
+
+from model.rpe_att import MultiHeadAttentionLayer, CausalSelfAttention
+
+# drop_out = 0.9
+
+
+class PositionalEncoding(nn.Module):
+
+    def __init__(self, d_model, dropout=0.2, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(
+            0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x, offset=0):
+        x = x + self.pe[offset:x.size(0)+offset, :]
+        return self.dropout(x)
+
+
+class LearnablePositionalEmbedding(nn.Module):
+    def __init__(self, d_model, max_len=512):
+        super().__init__()
+        # Compute the positional encodings once in log space.
+        pe = 0.1 * torch.randn(max_len, d_model)
+        pe = pe.unsqueeze(0)
+        self.weight = nn.Parameter(pe, requires_grad=True)
+
+    def forward(self, x):
+        return self.weight[:, :x.size(1), :]  # ( bs, seq,  Feature)
+
+
+class FFN(nn.Module):
+    def __init__(self, state_size=200):
+        super(FFN, self).__init__()
+        self.state_size = state_size
+
+        self.lr1 = nn.Linear(state_size, state_size)
+        self.relu = nn.ReLU()
+        self.lr2 = nn.Linear(state_size, state_size)
+        self.dropout = nn.Dropout(0.2)
+
+    def forward(self, x):
+        x = self.lr1(x)
+        x = self.relu(x)
+        x = self.lr2(x)
+        return self.dropout(x)
+
+
+def future_mask(seq_length):
+    future_mask = np.triu(
+        np.ones((seq_length, seq_length)), k=1).astype('bool')
+    return torch.from_numpy(future_mask)
+
+
+class MYMODEL(nn.Module):
+    def __init__(self, n_question, n_qtype, max_seq, embed_dim, n_query_features, n_key_value_features, n_gcn_layers, gcn_data, dropout, new_att=False):
+        super(MYMODEL, self).__init__()
+        self.n_question = n_question
+        self.embed_dim = embed_dim
+        self.seq_len = max_seq
+        self.n_query_features = n_query_features
+        ###
+        self.n_key_value_features = n_key_value_features
+
+        ###
+        # self.embedding = nn.Embedding(2*n_question+1, embed_dim)
+
+        self.pos_embedding = nn.Embedding(max_seq-1, embed_dim)
+        # self.pos_embedding = LearnablePositionalEmbedding(embed_dim, max_seq)
+        self.qt_embedding = nn.Embedding(n_qtype, embed_dim)
+
+        self.diff_embedding = nn.Linear(1, embed_dim)
+        self.ms_first_response_embedding = nn.Linear(1, embed_dim)
+        self.attempt_count_embedding = nn.Linear(1, embed_dim)
+
+        self.combine_q_embedding = nn.Linear(
+            embed_dim * n_query_features, embed_dim)
+        self.q_feature_layer_norm = nn.LayerNorm([max_seq-1, embed_dim])
+
+        ###
+        self.combine_x_embedding = nn.Linear(
+            embed_dim * n_key_value_features, embed_dim)
+        self.x_feature_layer_norm = nn.LayerNorm([max_seq-1, embed_dim])
+
+        self.gcn = LightGCNStack(
+            embed_dim=embed_dim, num_layers=n_gcn_layers, dataset=gcn_data)
+
+        self.multi_att = nn.MultiheadAttention(
+            embed_dim=embed_dim, num_heads=8, dropout=dropout) if not new_att else MultiHeadAttentionLayer(embed_dim, 8, dropout, 'cuda')
+
+        self.dropout = nn.Dropout(dropout)
+        self.layer_normal = nn.LayerNorm(embed_dim)
+
+        self.ffn = FFN(embed_dim)
+        self.pred = nn.Linear(embed_dim, 1)
+
+    def forward(self, x, question_ids, skill_ids, qt_ids, diff, ms_response_norm, attempt_count_norm):
+        # interact embedding
+        
+        ###
+        # x = self.embedding(x)
+        
+        # pos_id = torch.arange(x.size(1)).unsqueeze(0).cuda()
+        # pos_x = self.pos_embedding(pos_id)
+        # x = x + pos_x
+
+        qt = self.qt_embedding(qt_ids)
+
+        d_list, ms_list, attempt_list = [], [], []
+
+        for i in range(diff.shape[1]):
+            tmp = self.diff_embedding(
+                diff[:, i].unsqueeze(1).float()).unsqueeze(2)
+            d_list.append(tmp)
+        d = torch.cat(d_list, dim=2).long()
+        d = d.permute(2, 0, 1)
+        del d_list
+
+        for i in range(ms_response_norm.shape[1]):
+            tmp = self.ms_first_response_embedding(
+                ms_response_norm[:, i].unsqueeze(1).float()).unsqueeze(2)
+            ms_list.append(tmp)
+        ms = torch.cat(ms_list, dim=2).long()
+        ms = ms.permute(2, 0, 1)
+        del ms_list
+
+        for i in range(attempt_count_norm.shape[1]):
+            tmp = self.attempt_count_embedding(
+                attempt_count_norm[:, i].unsqueeze(1).float()).unsqueeze(2)
+            attempt_list.append(tmp)
+        attempt = torch.cat(attempt_list, dim=2).long()
+        attempt = attempt.permute(2, 0, 1)
+        del attempt_list
+
+        # get question and skill embeddings by lightgcn
+        W_Q, W_S = self.gcn.get_embeddings()
+        e = F.embedding(question_ids, W_Q)
+        s = F.embedding(skill_ids, W_S)
+
+        x = x.permute(1, 0, 2)  # x: [bs, s_len, embed] => [s_len, bs, embed]
+        e = e.permute(1, 0, 2)
+        s = s.permute(1, 0, 2)
+        qt = qt.permute(1, 0, 2)
+
+        combine_list_E = []
+        # bs, seq_len, embed_dim
+        combine_embed_E = torch.cat((e, s, qt, d), dim=2)
+        # todo test attribute feature
+        # combine_embed = torch.cat((e, qt, d, attempt, ms), dim=2)
+        for i in range(combine_embed_E.shape[0]):
+            tmp = self.combine_q_embedding(
+                combine_embed_E[i, :, :].float()).unsqueeze(0)
+            combine_list_E.append(tmp)
+        q_in = torch.cat(combine_list_E, dim=0)
+        del combine_list_E
+        q_in = self.q_feature_layer_norm(
+            q_in.permute(1, 0, 2)).permute(1, 0, 2)
+
+        ###
+        combine_list_I = []
+        # bs, seq_len, embed_dim
+        combine_embed_I = torch.cat((x, attempt, ms), dim=2)
+        # todo test attribute feature
+        # combine_embed = torch.cat((e, qt, d, attempt, ms), dim=2)
+        for i in range(combine_embed_I.shape[0]):
+            tmp = self.combine_x_embedding(
+                combine_embed_I[i, :, :].float()).unsqueeze(0)
+            combine_list_I.append(tmp)
+        x_in = torch.cat(combine_list_E, dim=0)
+        del combine_list_I
+        x_in = self.x_feature_layer_norm(
+            x_in.permute(1, 0, 2)).permute(1, 0, 2)
+        
+        
+
+        # k_in, v_in = q_in, x   # interact embedding is the k and v
+        k_in, v_in = x_in, x_in 
+
+        att_mask = future_mask(x_in.size(0)).cuda()
+        att_output, att_weight = self.multi_att(q_in, k_in, v_in, attn_mask=att_mask)
+        # changed
+        att_output = self.layer_normal(att_output + q_in)
+        # att_output: [s_len, bs, embed] => [bs, s_len, embed]
+        att_output = att_output.permute(1, 0, 2)
+
+        x = self.ffn(att_output)
+        x = self.layer_normal(x + att_output)
+        x = self.pred(x)
+
+        return x.squeeze(-1), att_weight
+
+
+
+class MYModule(pl.LightningModule):
+    def __init__(self, n_question, n_skill, n_qtype, max_seq, embed_dim, n_query_features, n_key_value_features, n_gcn_layers, gcn_data, dropout, new_att):
+        super(MYModule, self).__init__()
+        print(n_question, n_skill, n_qtype, max_seq,
+              embed_dim, n_query_features, gcn_data)
+        self.loss = nn.BCEWithLogitsLoss()
+        self.model = MYMODEL(n_question, n_qtype, max_seq,
+                             embed_dim, n_query_features, n_key_value_features, n_gcn_layers, gcn_data, dropout, new_att)
+        self.n_question = n_question
+
+    def forward(self, x, question_ids, skill_ids, qt_ids, diff, ms_response_norm, attempt_count_norm):
+        return self.model(x, question_ids, skill_ids, qt_ids, diff, ms_response_norm, attempt_count_norm)
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters())
+
+    def training_step(self, batch, batch_idx):
+        x, target_qid, target_sid, target_qtype, target_qd, target_qms, target_qattempt, label = batch
+
+        label = label.float()
+        target_mask = (target_qid != 0)
+
+        output, _ = self(x, target_qid, target_sid, target_qtype,
+                         target_qd, target_qms, target_qattempt)
+        output = torch.masked_select(output, target_mask)
+        label = torch.masked_select(label, target_mask)
+
+        loss = self.loss(output, label)
+        self.log("t_loss", loss, prog_bar=True)
+
+        return {'loss': loss, 'output': output, 'label': label}
+
+    def training_epoch_end(self, training_ouput):
+        out = torch.cat([i["output"] for i in training_ouput])
+        labels = torch.cat([i["label"] for i in training_ouput])
+
+        pred = (torch.sigmoid(out) >= 0.5).long()
+        acc = (pred == labels).sum() / len(pred)
+
+        out, labels = out.cpu().detach().numpy(), labels.cpu().detach().numpy()
+        auc = roc_auc_score(labels, out)
+
+        self.log_dict({'train_acc': acc, 'train_auc': auc}, prog_bar=True)
+
+    def validation_step(self, batch, batch_idx):
+        x, target_qid, target_sid, target_qtype, target_qd, target_qms, target_qattempt, label = batch
+        label = label.float()
+        target_mask = (target_qid != 0)
+
+        output, _ = self(x, target_qid, target_sid, target_qtype,
+                         target_qd, target_qms, target_qattempt)
+        output = torch.masked_select(output, target_mask)
+        label = torch.masked_select(label, target_mask)
+
+        loss = self.loss(output, label)
+        self.log("v_loss", loss, prog_bar=True)
+
+        return {'val_loss': loss, 'output': output, 'label': label}
+
+    def validation_epoch_end(self, validation_ouput):
+        out = torch.cat([i["output"] for i in validation_ouput])
+        labels = torch.cat([i["label"] for i in validation_ouput])
+
+        pred = (torch.sigmoid(out) >= 0.5).long()
+        acc = (pred == labels).sum() / len(pred)
+
+        out, labels = out.cpu().detach().numpy(), labels.cpu().detach().numpy()
+        auc = roc_auc_score(labels, out)
+
+        self.log_dict({'v_auc': auc, 'v_acc': acc}, prog_bar=True)

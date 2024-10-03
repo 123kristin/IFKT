@@ -1,0 +1,8 @@
+fig6系列是在以下生成
+/home/czy/KT/1/dataset/assist09/difficulty.ipynb
+/home/czy/KT/1/dataset/assist12/difficulty.ipynb
+/home/czy/KT/1/dataset/algebra_2006_2007/difficulty.ipynb
+fig7系列是在/home/czy/KT/1/assist09_main.ipynb下生成的
+fig3_weight.eps是在/home/czy/KT/BRIKT/weight.ipynb生成的
+fig3_weight.eps是在/home/czy/KT/BRIKT/weight.ipynb生成的
+fig_9是在/home/czy/KT/1/dataset/assist12/data describtion.ipynb中生成的fig_9_12.eps
